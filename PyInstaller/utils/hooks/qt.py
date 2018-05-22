@@ -21,6 +21,74 @@ from ...utils import misc
 logger = logging.getLogger(__name__)
 
 
+def _get_qt_paths_from_qcoreapplication(namespace):
+    return eval_statement("""
+        from {0}.QtCore import QCoreApplication;
+        app = QCoreApplication([]);
+        # For Python 2 print would give <PyQt4.QtCore.QStringList
+        # object at 0x....>", so we need to convert each element separately
+        str = getattr(__builtins__, 'unicode', str);  # for Python 2
+        print([str(p) for p in app.libraryPaths()])
+        """.format(namespace))
+
+
+def _get_library_path_information(namespace):
+    qli = json.loads(exec_statement("""
+        import json
+        from %s.QtCore import QLibraryInfo
+
+        paths = [x for x in dir(QLibraryInfo) if x.endswith('Path')]
+        location = {x: QLibraryInfo.location(getattr(QLibraryInfo, x))
+                    for x in paths}
+        try:
+            version = QLibraryInfo.version().segments()
+        except AttributeError:
+            version = None
+        print(str(json.dumps({
+            'isDebugBuild': QLibraryInfo.isDebugBuild(),
+            'version': version,
+            'location': location,
+        })))
+    """ % namespace))
+
+    # The following part fixes a problem where, sometimes, all path prefixes
+    # returned by QLibraryInfo are wrong, because they are paths from where
+    # Qt was built and not where it is installed (such as "c:/qt/...").
+    
+    # Since QCoreApplication returns the correct path prefix for the plugins
+    # directory, we use this in order to fix all paths returned from
+    # QLibraryInfo.
+    
+    plugins_suffix = '/plugins'
+    plugin_path_qli = qli['location']['PluginsPath']
+
+    if not plugin_path_qli.lower().endswith(plugins_suffix):
+        # The fix assumes that the 'PluginsPath' ends with '/plugins'.
+        # Just return the original path information if this is not the case.
+        return qli
+    if any(os.path.isdir(path) for path in qli['location'].values()):
+        # The fix assumes that all path prefixes all wrong. If at least
+        # one is correct, it's probably because some of them are missing
+        # (but it should be OK).
+        return qli
+
+    qca_paths = _get_qt_paths_from_qcoreapplication(namespace)
+    for path in qca_paths:
+        if path.lower().endswith(plugins_suffix):
+            plugin_path_qca = path
+            break
+    else:
+        return qli
+
+    correct_base = plugin_path_qca[:-len(plugins_suffix)]
+    wrong_base = plugin_path_qli[:-len(plugins_suffix)]
+
+    new_locations = {k: v.replace(wrong_base, correct_base) for k, v in qli['location'].items()}
+    qli['location'] = new_locations
+
+    return qli
+
+
 # Qt5LibraryInfo
 # --------------
 # This class uses introspection to determine the location of Qt5 files. This is
@@ -37,24 +105,7 @@ class Qt5LibraryInfo:
     # it.
     def __getattr__(self, name):
         if 'version' not in self.__dict__:
-            # Get library path information from Qt. See QLibraryInfo_.
-            qli = json.loads(exec_statement("""
-                import json
-                from %s.QtCore import QLibraryInfo
-
-                paths = [x for x in dir(QLibraryInfo) if x.endswith('Path')]
-                location = {x: QLibraryInfo.location(getattr(QLibraryInfo, x))
-                            for x in paths}
-                try:
-                    version = QLibraryInfo.version().segments()
-                except AttributeError:
-                    version = None
-                print(str(json.dumps({
-                    'isDebugBuild': QLibraryInfo.isDebugBuild(),
-                    'version': version,
-                    'location': location,
-                })))
-            """ % self.namespace))
+            qli = _get_library_path_information(self.namespace)
             for k, v in qli.items():
                 setattr(self, k, v)
 
@@ -67,6 +118,14 @@ class Qt5LibraryInfo:
 pyqt5_library_info = Qt5LibraryInfo('PyQt5')
 
 
+def _filter_valid_paths(paths):
+    valid_paths = []
+    for path in paths:
+        if os.path.isdir(path):
+            valid_paths.append(str(path))  # must be 8-bit chars for one-file builds
+    return valid_paths
+
+
 def qt_plugins_dir(namespace):
     """
     Return list of paths searched for plugins.
@@ -77,30 +136,30 @@ def qt_plugins_dir(namespace):
     """
     if namespace not in ['PyQt4', 'PyQt5', 'PySide', 'PySide2']:
         raise Exception('Invalid namespace: {0}'.format(namespace))
+
     if namespace == 'PyQt5':
         paths = [pyqt5_library_info.location['PluginsPath']]
     else:
-        paths = eval_statement("""
-            from {0}.QtCore import QCoreApplication;
-            app = QCoreApplication([]);
-            # For Python 2 print would give <PyQt4.QtCore.QStringList
-            # object at 0x....>", so we need to convert each element separately
-            str = getattr(__builtins__, 'unicode', str);  # for Python 2
-            print([str(p) for p in app.libraryPaths()])
-            """.format(namespace))
+        paths = _get_qt_paths_from_qcoreapplication(namespace)
+
     if not paths:
         raise Exception('Cannot find {0} plugin directories'.format(namespace))
-    else:
-        valid_paths = []
-        for path in paths:
-            if os.path.isdir(path):
-                valid_paths.append(str(path))  # must be 8-bit chars for one-file builds
-        qt_plugin_paths = valid_paths
+
+    qt_plugin_paths = _filter_valid_paths(paths)
+
+    paths_checked = paths
+    if not qt_plugin_paths and namespace == 'PyQt5':
+        # give a second try using paths from QCoreApplication because
+        # sometimes QLibraryInfo is wrongly configured
+        paths = _get_qt_paths_from_qcoreapplication(namespace)
+        paths_checked.extend(paths)
+        qt_plugin_paths = _filter_valid_paths(paths)
+
     if not qt_plugin_paths:
         raise Exception("""
             Cannot find existing {0} plugin directories
             Paths checked: {1}
-            """.format(namespace, ", ".join(paths)))
+            """.format(namespace, ", ".join(paths_checked)))
     return qt_plugin_paths
 
 
